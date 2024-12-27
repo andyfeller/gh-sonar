@@ -2,6 +2,14 @@
 
 A `gh` extension to scan and report on GitHub CLI extensions throughout user, organization, or enterprise account.
 
+Reliably discovering GitHub CLI extensions is difficult because extension authors must reliably follow specific conventions:
+
+1. Prefix the repository with `gh-`
+1. Name extension asset(s) appropriately
+1. Apply `gh-extension` topic to repository
+
+`gh-sonar` aims to scan any type of GitHub account to find buried treasure! :pirate_flag:
+
 ## Quickstart
 
 1. Download and install [jq](https://stedolan.github.io/jq/download/)
