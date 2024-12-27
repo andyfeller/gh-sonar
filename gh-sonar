@@ -1,0 +1,417 @@
+#! /usr/bin/env bash
+#
+# TODO: This script needs to be enhanced for significantly large enterprises, organizations, and their members.
+#
+#       1. Iterating over enterprises needs a way to pick up on the last organization when scanning was interrupted
+#       2. Iterating over enterprise and organization members needs a way to pick up on the last member when scanning was interrupted
+#
+set -e
+
+ENTERPRISE=false
+MEMBERS=false
+PRIVATE=false
+
+__USAGE="
+Scan and report on GitHub CLI extensions throughout user, organization, or enterprise account.
+
+USAGE
+  gh sonar [flags] [ <organization> | <user> | -e <enterprise> ] > report.md
+
+FLAGS
+  -d, --debug                         Enable debugging
+  -e, --enterprise                    Process as enterprise instead of organization; requires 'read:enterprise' scope
+  -h, --help                          Display help usage
+      --hostname=string               Hostname of the GitHub instance to authenticate with
+  -m, --members                       Extend scanning to member repositories
+  -p, --private                       Extend scanning to non-public repositories
+
+EXAMPLES
+  # Scan yourself
+  $ gh sonar > you.md
+
+  # Scan yourself including private repositories
+  $ gh sonar -p > you.md
+
+  # Scan yours truly
+  $ gh sonar andyfeller > andyfeller.md
+
+  # Scan organization including private repositories
+  $ gh sonar -p tinyfists > tinyfists.md
+
+  # Scan organization and member repositories including private repositories
+  $ gh sonar -p -m tinyfists > tinyfists-with-members.md
+
+  # Scan enterprise including private repositories
+  $ gh sonar -p -e opensource > opensource.md
+
+  # Scan enterprise and member repositories including private repositories
+  $ gh sonar -p -m -e opensource > opensource-with-members.md
+";
+
+# check_ratelimit() attempts to proactively figure out if scanning should pause to avoid rate limiting.
+check_ratelimit() {
+  # Retrieve `gh api /rate_limit` information
+  local RATE_LIMIT="$(gh api '/rate_limit' --jq '. | @base64')"
+
+  __jq() {
+    echo -n "$RATE_LIMIT" | base64 --decode | jq -r "${1}"
+  }
+
+  # ... and check `resources.core` section
+  local NOW=$(now)
+  local CORE_REMAINING=$(__jq '.resources.core.remaining')
+  local CORE_RESET=$(__jq '.resources.core.reset')
+  local CORE_SLEEP=$((CORE_RESET - NOW))
+
+  if [[ "$CORE_REMAINING" -eq 0 && "$CORE_SLEEP" -gt 0 ]]; then
+    echo_progress "Core resource rate limit exceeded. Sleeping for $CORE_SLEEP seconds ..."
+    sleep "$CORE_SLEEP"
+  fi
+
+  # ... and check `resources.search` section
+  local NOW=$(now)
+  local scan_REMAINING=$(__jq '.resources.search.remaining')
+  local scan_RESET=$(__jq '.resources.search.reset')
+  local scan_SLEEP=$((SEARCH_RESET - NOW))
+
+  if [[ "$scan_REMAINING" -eq 0 && "$SEARCH_SLEEP" -gt 0 ]]; then
+    echo_progress "Search resource rate limit exceeded. Sleeping for $scan_SLEEP seconds ..."
+    sleep "$scan_SLEEP"
+  fi
+
+  # ... and check `rate` section
+  local NOW=$(now)
+  local RATE_REMAINING=$(__jq '.rate.remaining')
+  local RATE_RESET=$(__jq '.rate.reset')
+  local RATE_SLEEP=$((RATE_RESET - NOW))
+
+  if [[ "$RATE_REMAINING" -eq 0 && "$RATE_SLEEP" -gt 0 ]]; then
+    echo_progress "Primary rate limit exceeded. Sleeping for $RATE_SLEEP seconds ..."
+    sleep "$RATE_SLEEP"
+  fi
+}
+
+# die() exits script, printing error message and usage statement.
+die() {
+  printf "\nError: %s\n" "$1"
+  echo "$__USAGE"
+  exit 1
+}
+
+# echo_progress() notifies user of script progress using stderr.
+echo_progress() {
+  if [ -z "$NO_COLOR" ]; then
+    >&2 echo -e "\033[1;33m$1\033[0m"
+  else
+    >&2 echo "$1"
+  fi
+}
+
+# now() generates timestamp in seconds.
+now() {
+  local NOW="0"
+
+  if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    NOW=$(date '+%s')
+  elif [[ "$OSTYPE" == "darwin"* ]]; then
+    NOW=$(date -j '+%s')
+  fi
+
+  echo "$NOW"
+}
+
+# scan_enterprise() scans enterprise accounts for GitHub CLI extension repositories.
+scan_enterprise() {
+	local ENT="$1"
+  echo_progress "Scanning enterprise:  $ENT"
+
+  # Notify user scanning is going to begin and scope of efforts
+  local QUERY='
+  query ($enterprise:String!) {
+    enterprise(slug: $enterprise) {
+      organizations {
+        totalCount
+      }
+    }
+  }'
+
+  local COUNT=$(gh api graphql -f query="${QUERY}" -F enterprise="$ENT" --jq '.data.enterprise.organizations.totalCount')
+  echo_progress "Scanning enterprise organizations:  $COUNT"
+	printf -- "# \`%s\` enterprise scan\n" "$ENT"
+	printf -- "\n## organization extensions\n\n"
+
+  # Process enterprise organizations
+	local QUERY='
+	query ($enterprise:String!, $endCursor:String) {
+	  enterprise(slug: $enterprise) {
+		  organizations(first:100, after:$endCursor) {
+		    pageInfo {
+			    endCursor
+			    hasNextPage
+		    }
+		    nodes {
+			    login
+		    }
+		  }
+	  }
+	}'
+
+  # TODO: Add --paginate --slurp support
+	for org in $(gh api graphql -f query="$QUERY" -F enterprise="$ENT" --paginate --jq '.data.enterprise.organizations.nodes | sort_by(.login | ascii_downcase) | .[].login'); do
+		scan_repos "$org"
+	done
+
+  # Process enterprise members as necessary
+  if $MEMBERS; then
+	  printf -- "\n## member extensions\n\n"
+    scan_enterprise_members "$ENT"
+  fi
+}
+
+# scan_enterprise_members() scans enterprise member repositories for GitHub CLI extension repositories.
+scan_enterprise_members() {
+  local ENT="$1"
+
+  # Notify user scanning is going to begin and scope of efforts
+  local QUERY='
+  query ($enterprise:String!) {
+    enterprise(slug: $enterprise) {
+      members {
+        totalCount
+      }
+    }
+  }'
+
+  local COUNT=$(gh api graphql -f query="${QUERY}" -F enterprise="$ENT" --jq '.data.organization.membersWithRole.totalCount')
+  echo_progress "Scanning enterprise members:  $COUNT"
+
+  # Process enterprise member repositories
+  local QUERY='
+  query ($enterprise:String!, $endCursor:String) {
+    enterprise(slug: $enterprise) {
+      members(first:100, after:$endCursor) {
+        pageInfo {
+          endCursor
+          hasNextPage
+        }
+        nodes {
+          login
+        }
+      }
+    }
+  }'
+
+  # TODO: Add --paginate --slurp support
+  for member in $(gh api graphql -f query="$QUERY" -F enterprise="$ENT" --paginate --jq '.data.enterprise.members.nodes | sort_by(.login | ascii_downcase) | .[].login'); do
+    scan_repos "$member"
+  done
+}
+
+# scan_organization() scans organization accounts for GitHub CLI extension repositories.
+scan_organization() {
+  local ORG="$1"
+
+  # Notify user scanning is going to begin; scope of efforts is handled by `scan_repos`
+  echo_progress "Scanning organization:  $ORG"
+	printf -- "# \`%s\` organization scan\n" "$ORG"
+	printf -- "\n## organization extensions\n\n"
+  scan_repos "$ORG"
+
+  # Process organization members as necessary
+  if $MEMBERS; then
+	  printf -- "\n## member extensions\n\n"
+    scan_organization_members "$ORG"
+  fi
+}
+
+# scan_organization_members() scans organization member repositories for GitHub CLI extension repositories.
+scan_organization_members() {
+  local ORG="$1"
+
+  # Notify user scanning is going to begin and scope of efforts
+  local QUERY='
+  query($login: String!) {
+    organization(login: $login) {
+      membersWithRole {
+        totalCount
+      }
+    }
+  }'
+
+  local COUNT=$(gh api graphql -f query="${QUERY}" -F login="$ORG" --jq '.data.organization.membersWithRole.totalCount')
+  echo_progress "Scanning organization members:  $COUNT"
+
+  # Process organization member repositories
+  local QUERY='
+  query($login: String!, $endCursor: String) {
+    organization(login: $login) {
+      membersWithRole(first: 100, after: $endCursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          login
+        }
+      }
+    }
+  }'
+
+  # TODO: Add --paginate --slurp support
+  for member in $(gh api graphql -f query="${QUERY}" -F login="$ORG" --paginate --jq '.data.organization.membersWithRole.nodes | sort_by(.login | ascii_downcase) | .[].login'); do
+    scan_repos "$member"
+  done
+}
+
+# scan_repos() searches user or organization accounts for GitHub CLI extension repositories.
+#
+# There are multiple situations to consider:
+#
+# 1. Whether repository includes `gh-extension` topic
+# 2. Whether repository is `gh-` prefixed
+scan_repos() {
+	local OWNER="$1"
+
+  # Notify user scanning is going to begin and scope of efforts
+  local QUERY='
+  query ($owner: String!) {
+    repositoryOwner(login: $owner) {
+      repositories {
+        totalCount
+      }
+    }
+  }'
+
+  local COUNT=$(gh api graphql -f query="${QUERY}" -F owner="$OWNER" --jq '.data.repositoryOwner.repositories.totalCount')
+  echo_progress "Scanning $OWNER repositories:  $COUNT"
+
+  # TODO: figure the right place to reasonably handle rate limit checking, might be a little too aggressive if done here
+  # check_ratelimit
+
+  # First, the easy part: searching for GitHub CLI extensions with `gh-extension` topic
+	scan_repos_process "$(gh search repos --topic gh-extension --owner "$OWNER" --archived=false --limit 1000 --json isPrivate,name,owner,url --template "$TEMPLATE")"
+
+	# Second, the difficult part: searching for GitHub CLI extensions without `gh-extension` topic but are prefixed `gh-`.
+	scan_repos_process "$(gh search repos --owner "$OWNER" --archived=false --limit 1000 --json isPrivate,name,owner,url -- -topic:gh-extension in:name "gh-")"
+}
+
+# scan_repos_process() iterates over search_repos(), filtering and formatting potential GitHub CLI extension repository.
+scan_repos_process() {
+	local REPOS="$1"
+
+	for REPO in $(echo "$REPOS" | jq -r 'sort_by(.name | ascii_downcase) | .[] | @base64'); do
+		__jq() {
+			echo -n "$REPO" | base64 --decode | jq -r "${1}"
+		}
+
+		local IS_PRIVATE=$(__jq '.isPrivate')
+		local NAME=$(__jq '.name')
+		local OWNER=$(__jq '.owner.login')
+		local URL=$(__jq '.url')
+
+    # Only report on non-public repositories if -p,--private flag is set
+    if ! $PRIVATE && $IS_PRIVATE; then
+      continue
+    fi
+
+    # Only report on repositories properly prefixed with `gh-`
+    # TODO: Consider expanding information to capture repository not prefixed with `gh-`
+    if [[ "$NAME" != "gh-"* ]]; then
+      continue
+    fi
+
+    # TODO: Consider how false positives might be filtered out better; `github/gh-ost` is not a GitHub CLI extension`
+    # TODO: Consider expanding information to capture whether repository has `gh-extension` topic
+    printf -- "1. [%s/%s](%s)\n" "$OWNER" "$NAME" "$URL"
+	done
+}
+
+# scan_user() scans user accounts for GitHub CLI extension repositories.
+scan_user() {
+  local USER="$1"
+
+  echo_progress "Scanning user:  $USER"
+	printf -- "# \`%s\` user scan\n\n" "$USER"
+  scan_repos "$USER"
+}
+
+if ! type -p gh > /dev/null; then
+	die "'gh' could not be found"
+fi
+
+if ! type -p jq > /dev/null; then
+	die "'jq' could not be found"
+fi
+
+while getopts "dehmp-:" OPT; do
+  if [ "$OPT" = "-" ]; then     # long option: reformulate OPT and OPTARG
+    OPT="${OPTARG%%=*}"         # extract long option name
+    OPTARG="${OPTARG#"$OPT"}"   # extract long option argument (may be empty)
+    OPTARG="${OPTARG#=}"        # if long option argument, remove assigning `=`
+  fi
+
+  case "$OPT" in
+    debug | d)
+      export GH_DEBUG=api
+      ;;
+
+		enterprise | e)
+			ENTERPRISE=true
+			;;
+
+    help | h)
+      echo "$__USAGE"
+      exit 0
+      ;;
+
+    hostname)
+      export GH_HOST="${OPTARG}"
+      ;;
+
+		members | m)
+			MEMBERS=true
+			;;
+
+		private | p)
+			PRIVATE=true
+			;;
+  esac
+done
+
+# shift so that $@, $1, etc. refer to the non-option arguments
+shift "$((OPTIND-1))"
+
+# Process argument for user/organization/enterprise accordingly
+case "$#" in
+  0)
+    OWNER=$(gh api user --jq '.login')
+    ;;
+  1)
+    OWNER="$1"
+    ;;
+  *)
+    die "Must provide 1 user, organization, or enterprise login"
+    ;;
+esac
+
+QUERY='
+query ($owner: String!) {
+  repositoryOwner(login: $owner) {
+    ... on User {
+      type: __typename
+    }
+    ... on Organization {
+      type: __typename
+    }
+  }
+}'
+
+TYPE=$(gh api graphql -f query="${QUERY}" -F owner="$OWNER" --jq '.data.repositoryOwner.type')
+
+if [[ "$TYPE" == "User" ]]; then
+  scan_user "$OWNER"
+elif $ENTERPRISE; then
+  scan_enterprise "$OWNER"
+else
+  scan_organization "$OWNER"
+fi
